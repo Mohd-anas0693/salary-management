@@ -1,0 +1,342 @@
+// =============================================================================
+// ACME Employee Salary Management — Prisma schema DRAFT v2
+// Status: design draft for review (2026-11-22). NO migrations generated yet.
+// Companion: database-design.md (authoritative for constraints this file cannot express)
+// =============================================================================
+//
+// TARGET VERSION: Prisma 6.x (>= 6.0), PostgreSQL 16. Every construct below was checked
+// against that target; see the compatibility notes at the end of this header.
+//
+// WHAT PRISMA OWNS HERE: tables, columns, PostgreSQL types, relations, plain indexes.
+//
+// WHAT PRISMA CANNOT EXPRESS — hand-written SQL appended to the generated migration
+// (database-design.md §8), verified by integration tests:
+//   1. Append-only triggers on salary_event, audit_log AND export_log (no UPDATE/DELETE)
+//   2. BEFORE INSERT trigger on salary_event:
+//        a. employee ACTIVE                       -> 422 EMPLOYEE_INACTIVE
+//        b. effective_date >= employee.hire_date
+//        c. superseded event belongs to same employee
+//        d. amount = round(amount, currency.minor_units)  -> 400 INVALID_DECIMAL_SCALE
+//        e. currency.is_active
+//        f. non-correcting currency change is prospective (effective_date >= UTC today)
+//           and carries change_reason = 'CURRENCY_CHANGE'
+//   3. CHECK constraints: amount > 0, supersedes_event_id < id, correction_reason required
+//      when superseding, change_reason / status / country_code / minor_units value lists,
+//      and the audit_log actor-nullability pair (actor required unless LOGIN_FAILURE)
+//   4. Views: employee_current_salary, salary_event_resolved
+//   5. Function: salary_as_of(employee_id, as_of date, known_at timestamptz)
+//   6. GIN trigram index on employee.search_text + the pg_trgm extension
+//   7. Generated column employee.search_text
+//   8. Partial index hr_session(token_hash) WHERE revoked_at IS NULL
+//   9. GRANTs: app role has SELECT/INSERT only on the three append-only tables and holds
+//      no DELETE privilege on any table
+//
+// SERIALIZATION RULES (enforced in DTO mappers, not here):
+//   - Decimal  -> JSON string, rounded to currency.minor_units  ("85000.00", "9000000",
+//                 "12345.678"). Lossless, because stored amounts never carry more
+//                 decimals than their currency permits (rule 2d above).
+//   - BigInt   -> JSON string (BigInt is not JSON-serializable by default).
+//   - DATE     -> "YYYY-MM-DD";  TIMESTAMPTZ -> ISO-8601 UTC.
+//
+// CURRENCY MODEL (v2): currency lives on SalaryEvent only. Employee has no currency
+// column; current currency is derived from the current salary event. See ADR-011.
+//
+// Enum-like columns are String + a SQL CHECK rather than Prisma/PostgreSQL enums:
+// adding a change reason or audit action stays a one-line migration, and Zod still gives
+// TypeScript a closed union at the edge (database-design.md §3.1).
+//
+// ---------------------------------------------------------------------------
+// PRISMA 6.x COMPATIBILITY NOTES (validation pass, 2026-11-22)
+//   OK  BigInt @id @default(autoincrement())      -> bigserial
+//   OK  Decimal @db.Decimal(20, 4)                -> numeric(20,4); client type Decimal
+//                                                    (decimal.js). Never mapped to Float.
+//   OK  @db.Citext, @db.Char(n), @db.Inet, @db.SmallInt, @db.Timestamptz(3), @db.Date
+//   OK  Bytes                                     -> bytea
+//   OK  Json                                      -> jsonb by default on PostgreSQL
+//   OK  @@index([a(sort: Desc), b(sort: Desc)])   -> GA since Prisma 4.0 (extendedIndexes)
+//   OK  Self-relation 1:1 via @unique on the FK scalar, with a named relation on both
+//       sides; the back-relation field is optional and declares no fields/references.
+//   OK  Optional relation + onDelete: Restrict    -> explicit, overrides the SetNull default
+//   PREVIEW  previewFeatures = ["views"]          -> `view` blocks are still preview in 6.x;
+//            views are NOT created by `prisma migrate` (our SQL creates them) and each view
+//            needs a unique identifier for the client, provided here via @unique.
+//   PREVIEW  previewFeatures = ["postgresqlExtensions"] + datasource `extensions`
+//            -> lets citext/pg_trgm be declared here instead of a manual CREATE EXTENSION.
+//   N/A      No Prisma enums (deliberate, see above) -> no ALTER TYPE migrations.
+//   FALLBACK If either preview feature is undesirable in production, the views are read
+//            through $queryRaw with Zod-parsed results and the extensions are created in
+//            the hand-written migration SQL. Both are one-file changes in shared/db.
+//   NOTE     generator `prisma-client-js` is the stable default; the newer ESM
+//            `prisma-client` generator is deliberately not used in MVP.
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["views", "postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [citext, pg_trgm]
+}
+
+// ============================== Authentication ===============================
+
+model HrUser {
+  id           BigInt   @id @default(autoincrement())
+  email        String   @unique @db.Citext
+  passwordHash String   @map("password_hash")                       // argon2id
+  fullName     String   @map("full_name")
+  /// CHECK (role IN ('HR_MANAGER'))
+  role         String   @default("HR_MANAGER")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions     HrSession[]
+  salaryEvents SalaryEvent[] @relation("RecordedBy")
+  auditEntries AuditLog[]
+  exports      ExportLog[]
+
+  @@map("hr_user")
+}
+
+model HrSession {
+  id                BigInt    @id @default(autoincrement())
+  /// SHA-256 of the opaque token. The raw token is never stored.
+  tokenHash         Bytes     @unique @map("token_hash")
+  hrUserId          BigInt    @map("hr_user_id")
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  lastSeenAt        DateTime  @default(now()) @map("last_seen_at") @db.Timestamptz(3)
+  absoluteExpiresAt DateTime  @map("absolute_expires_at") @db.Timestamptz(3)
+  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(3)
+  ipAddress         String?   @map("ip_address") @db.Inet
+  userAgent         String?   @map("user_agent")
+
+  hrUser HrUser @relation(fields: [hrUserId], references: [id], onDelete: Cascade)
+
+  @@index([hrUserId])
+  @@index([absoluteExpiresAt]) // expired-session cleanup
+  @@map("hr_session")
+}
+
+// ============================== Reference data ===============================
+
+model Department {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique @db.Citext
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  employees Employee[]
+
+  @@map("department")
+}
+
+model Currency {
+  /// ISO-4217 alpha code, e.g. "USD", "JPY", "KWD"
+  code       String  @id @db.Char(3)
+  name       String
+  /// Permitted decimal places for amounts in this currency.
+  /// CHECK (minor_units IN (0, 2, 3)) — JPY 0, USD/EUR 2, KWD/BHD/OMR/TND 3.
+  /// Storage is always numeric(20,4); this is the semantic scale, enforced by trigger
+  /// (amount = round(amount, minor_units)) and used as the display scale in the API.
+  minorUnits Int     @map("minor_units") @db.SmallInt
+  isActive   Boolean @default(true) @map("is_active")
+
+  salaryEvents SalaryEvent[]
+
+  @@map("currency")
+}
+
+// ================================= Employee ==================================
+// NOTE (v2): no currency column. An employee's currency is whatever their current
+// salary event says; an employee with no event has no currency (ADR-011).
+
+model Employee {
+  id           BigInt    @id @default(autoincrement())
+  employeeCode String    @unique @map("employee_code") @db.Citext
+  email        String    @unique @db.Citext
+  firstName    String    @map("first_name")
+  lastName     String    @map("last_name")
+  jobTitle     String    @map("job_title")
+  departmentId Int       @map("department_id")
+  /// ISO-3166-1 alpha-2; CHECK (country_code ~ '^[A-Z]{2}$')
+  countryCode  String    @map("country_code") @db.Char(2)
+  hireDate     DateTime  @map("hire_date") @db.Date
+  /// CHECK (status IN ('ACTIVE','INACTIVE')) and status/deactivated_at kept consistent.
+  /// There is no deletion path: no endpoint, no service method, no DELETE grant.
+  status       String    @default("ACTIVE")
+  deactivatedAt      DateTime? @map("deactivated_at") @db.Timestamptz(3)
+  deactivationReason String?   @map("deactivation_reason")
+  /// Optimistic concurrency token (database-design.md §11)
+  version      Int       @default(1)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  // SQL-only: search_text generated column + GIN trigram index for FR-3 substring search.
+
+  department   Department    @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  salaryEvents SalaryEvent[]
+  auditEntries AuditLog[]
+
+  @@index([status, departmentId])
+  @@index([status, countryCode])
+  @@index([lastName, firstName, id]) // stable sort + pagination
+  @@index([hireDate, id])
+  @@map("employee")
+}
+
+// ======================= Salary events (APPEND-ONLY) =========================
+//
+// Never updated, never deleted. A mistake is corrected by inserting a NEW event
+// whose supersedesEventId points at the event being corrected. Supersession is
+// DERIVED from that pointer — there is deliberately no is_superseded column,
+// because maintaining one would require an UPDATE (database-design.md §4.2).
+//
+// This row is the sole source of truth for BOTH the amount and the currency.
+
+model SalaryEvent {
+  id         BigInt   @id @default(autoincrement())
+  employeeId BigInt   @map("employee_id")
+
+  /// Exact decimal. CHECK (amount > 0). Trigger: amount = round(amount, minor_units).
+  /// Never a float, anywhere, in any layer (ADR-004).
+  amount     Decimal  @db.Decimal(20, 4)
+  /// The currency actually paid for this event. Historical events keep theirs forever;
+  /// a prospective change is a new event with change_reason = 'CURRENCY_CHANGE';
+  /// a mis-entered currency is fixed by a correction with a mandatory reason (ADR-011).
+  currency   String   @db.Char(3)
+
+  /// WHEN THE MONEY CHANGES. May be backdated or future-dated (UTC boundary, ADR-012).
+  effectiveDate DateTime @map("effective_date") @db.Date
+  /// WHEN WE LEARNED IT. Set by the database, never by the client.
+  recordedAt    DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  /// CHECK: HIRE | MERIT | PROMOTION | MARKET_ADJUSTMENT | DEMOTION
+  ///      | CURRENCY_CHANGE | CORRECTION | OTHER
+  changeReason String  @map("change_reason")
+  note         String?
+
+  /// UNIQUE: forbids forked correction chains and makes concurrent corrections
+  /// fail fast with 409 EVENT_ALREADY_SUPERSEDED.
+  /// CHECK (supersedes_event_id < id) makes cycles structurally impossible.
+  supersedesEventId BigInt? @unique @map("supersedes_event_id")
+  /// Required when supersedesEventId is set (CHECK). Covers currency corrections.
+  correctionReason  String? @map("correction_reason")
+
+  recordedByHrUserId BigInt @map("recorded_by_hr_user_id")
+
+  employee    Employee @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  currencyRef Currency @relation(fields: [currency], references: [code], onDelete: Restrict)
+  recordedBy  HrUser   @relation("RecordedBy", fields: [recordedByHrUserId], references: [id], onDelete: Restrict)
+
+  /// Self-relation, 1:1 by virtue of @unique on supersedesEventId.
+  supersedes   SalaryEvent? @relation("SalaryCorrection", fields: [supersedesEventId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  supersededBy SalaryEvent? @relation("SalaryCorrection")
+
+  /// THE resolution index: matches ORDER BY effective_date DESC, recorded_at DESC, id DESC
+  /// so DISTINCT ON in employee_current_salary needs no sort (database-design.md §7).
+  @@index([employeeId, effectiveDate(sort: Desc), recordedAt(sort: Desc), id(sort: Desc)])
+  @@index([recordedAt(sort: Desc)]) // dashboard "recent salary changes"
+  @@index([effectiveDate, id])      // paginated upcoming scheduled changes
+  @@index([currency])               // per-currency analytics grouping
+  @@map("salary_event")
+}
+
+// ========================= Audit log (APPEND-ONLY) ===========================
+
+model AuditLog {
+  id BigInt @id @default(autoincrement())
+
+  /// NULLABLE (v2): a failed login for an unknown email has no hr_user to reference.
+  /// CHECK (actor_hr_user_id IS NOT NULL OR action IN ('LOGIN_FAILURE')) keeps the
+  /// relaxation scoped to unauthenticated events only (database-design.md §3.6).
+  actorHrUserId        BigInt? @map("actor_hr_user_id")
+  /// The email address typed at a failed login. Required for LOGIN_FAILURE.
+  /// The submitted password is never stored, in any form.
+  actorEmailAttempted  String? @map("actor_email_attempted")
+
+  /// CHECK: LOGIN_SUCCESS | LOGIN_FAILURE | LOGOUT | EMPLOYEE_CREATE | EMPLOYEE_UPDATE
+  ///      | EMPLOYEE_DEACTIVATE | EMPLOYEE_REACTIVATE | SALARY_CREATE | SALARY_CORRECT | EXPORT
+  action      String
+  /// CHECK: EMPLOYEE | SALARY_EVENT | SESSION
+  entityType  String  @map("entity_type")
+  entityId    BigInt? @map("entity_id")
+  /// Denormalized for "show me everything about this employee" filtering.
+  employeeId  BigInt? @map("employee_id")
+  /// Amounts here are intentional and access-controlled — unlike application
+  /// log files, which must never contain them (architecture.md §8).
+  beforeState Json?   @map("before_state")
+  afterState  Json?   @map("after_state")
+  reason      String?
+  recordedAt  DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+  ipAddress   String?  @map("ip_address") @db.Inet
+  requestId   String?  @map("request_id")
+
+  actor    HrUser?   @relation(fields: [actorHrUserId], references: [id], onDelete: Restrict)
+  employee Employee? @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+
+  @@index([employeeId, recordedAt(sort: Desc)])
+  @@index([actorHrUserId, recordedAt(sort: Desc)])
+  @@index([recordedAt(sort: Desc)])
+  @@index([action, recordedAt(sort: Desc)])
+  @@map("audit_log")
+}
+
+// ========================= Export log (APPEND-ONLY) ==========================
+// Bulk export is the realistic exfiltration path in a compensation system, so
+// every export is recorded with its filters and row count (architecture.md §8).
+// v2: covered by its own immutability trigger, like the other append-only tables.
+
+model ExportLog {
+  id             BigInt   @id @default(autoincrement())
+  actorHrUserId  BigInt   @map("actor_hr_user_id")
+  /// CHECK: EMPLOYEES | SALARY_HISTORY
+  exportType     String   @map("export_type")
+  filtersApplied Json     @map("filters_applied")
+  rowCount       Int      @map("row_count")
+  recordedAt     DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
+
+  actor HrUser @relation(fields: [actorHrUserId], references: [id], onDelete: Restrict)
+
+  @@index([actorHrUserId, recordedAt(sort: Desc)])
+  @@map("export_log")
+}
+
+// ================================== Views ====================================
+// Created by hand-written SQL (database-design.md §5). Mapped here as read-only
+// Prisma views so the client is typed; `prisma migrate` does not create them.
+// Both carry currency, which is how the application reads an employee's CURRENT
+// currency now that Employee has no currency column (ADR-011).
+
+view EmployeeCurrentSalary {
+  employeeId    BigInt   @unique @map("employee_id")
+  salaryEventId BigInt   @map("salary_event_id")
+  amount        Decimal  @db.Decimal(20, 4)
+  currency      String   @db.Char(3)
+  effectiveDate DateTime @map("effective_date") @db.Date
+  recordedAt    DateTime @map("recorded_at") @db.Timestamptz(3)
+  changeReason  String   @map("change_reason")
+
+  @@map("employee_current_salary")
+}
+
+view SalaryEventResolved {
+  id                BigInt    @unique
+  employeeId        BigInt    @map("employee_id")
+  amount            Decimal   @db.Decimal(20, 4)
+  currency          String    @db.Char(3)
+  effectiveDate     DateTime  @map("effective_date") @db.Date
+  recordedAt        DateTime  @map("recorded_at") @db.Timestamptz(3)
+  changeReason      String    @map("change_reason")
+  note              String?
+  supersedesEventId BigInt?   @map("supersedes_event_id")
+  correctionReason  String?   @map("correction_reason")
+  supersededById    BigInt?   @map("superseded_by_id")
+  supersededAt      DateTime? @map("superseded_at") @db.Timestamptz(3)
+  isSuperseded      Boolean   @map("is_superseded")
+
+  @@map("salary_event_resolved")
+}

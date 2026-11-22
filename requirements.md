@@ -10,13 +10,14 @@ auditable history and analytics of what the organisation pays.
 
 | # | Rule |
 |---|---|
-| D-1 | **Deterministic resolution.** An employee's salary on date *D* is the event with the greatest `effective_date ≤ D`; ties are broken by later `created_at`, then by higher event id. Exactly one event resolves for any date, and the same inputs always resolve the same way. |
+| D-1 | **Deterministic resolution.** An employee's salary on date *D* is the event with the greatest `effective_date ≤ D`; ties are broken by later `recorded_at`, then by higher event id. Exactly one event resolves for any date, and the same inputs always resolve the same way. |
 | D-2 | **Append-only.** Salary events are never updated or deleted. No write path can silently overwrite an existing event; enforced at the data layer, not only in application code. |
-| D-3 | **Corrections preserve the original.** A correction is a *new* event that references the event it corrects (`corrects_event_id`) and carries a mandatory reason. The original remains stored and visible, marked superseded; both appear in history with the correction relationship shown. |
+| D-3 | **Corrections preserve the original.** A correction is a *new* event that references the event it corrects (`supersedes_event_id`) and carries a mandatory reason. The original remains stored and visible, shown as superseded (derived from the pointer, never a mutation of the original row); both appear in history with the correction relationship shown. |
 | D-4 | **As-of queries.** Salary history answers "what was this employee paid on date *D*" for any past or present date under D-1. Future-dated events are stored and excluded from "current" until their effective date arrives. |
-| D-5 | **Exact money.** Amounts are exact decimals (fixed scale, e.g. `NUMERIC(14,2)`) paired with an ISO-4217 currency code. No floating-point type in storage, arithmetic, or transport; decimal values are serialized as **strings** in API responses. |
+| D-5 | **Exact money.** Amounts are exact decimals (`NUMERIC(20,4)`) paired with an ISO-4217 currency code, and may carry only as many decimal places as that currency permits (0, 2 or 3 minor units), validated against reference data. No floating-point type in storage, arithmetic, or transport; decimal values are serialized as **strings** at the currency's own precision in API responses. |
 | D-6 | **No cross-currency arithmetic.** Every total, average, median and bucket is grouped by currency. Amounts in different currencies are never summed, averaged together, or converted. |
-| D-7 | **No destructive deletion.** Deactivation is a status change. An employee with salary history is never physically deleted; their salary and audit records are retained and remain queryable after deactivation. |
+| D-7 | **No destructive deletion.** Deactivation is a status change, and it is the only way to retire a record: no employee is ever physically deleted, whether or not they have salary history. Salary and audit records are retained and remain queryable after deactivation. |
+| D-8 | **Currency belongs to the salary event.** An employee has no currency of their own; their current currency is derived from their current salary event, and historical events keep the currency they were paid in. A currency change is a new, prospective event; a mis-entered currency is fixed by a correction with a mandatory reason. |
 
 ## 2. Functional requirements (MVP)
 
@@ -67,7 +68,7 @@ auditable history and analytics of what the organisation pays.
 ## 5. Confirmed decisions
 
 1. **Visibility** — all HR Managers have organization-wide salary visibility; no per-department scoping.
-2. **Backdating** — permitted, with a mandatory reason, audited with both entry and effective dates (FR-4).
+2. **Backdating** — permitted for amounts, with a mandatory reason, audited with both entry and effective dates (FR-4). A *currency* change may not be backdated (D-8).
 3. **Statistics** — average *and* median in department/country comparisons; average on dashboard KPI tiles (FR-8, FR-10).
 4. **Deactivated employees** — excluded from active payroll totals, counted separately, and fully accessible historically (D-7, FR-8).
 
@@ -75,7 +76,7 @@ auditable history and analytics of what the organisation pays.
 
 1. Employee and salary data originates in this system; no external HRIS integration.
 2. Base salary is the only compensation component; amounts are annual.
-3. Salary events are entered in the employee's existing currency.
+3. A salary event is normally entered in the currency the employee is already paid in; a change of currency is possible prospectively (D-8).
 4. Browser-based desktop use on modern browsers.
 
-**No open decisions remain. Awaiting approval to begin implementation.**
+**Architecture decisions and remaining open items are tracked in [architecture.md](architecture.md) §10 and [architecture-decisions.md](architecture-decisions.md).**
