@@ -1,6 +1,6 @@
 # Database Design — ACME Employee Salary Management
 
-**Status:** Draft v2 for review · 2026-11-22 · Design only; no migrations generated.
+**Status:** Draft v3 for review · 2026-11-22 · Design only; no migrations generated.
 **Engine:** PostgreSQL 16 · **Access:** Prisma ORM + hand-written SQL for views, triggers
 and analytics. Companion: [architecture.md](architecture.md) ·
 [prisma-schema-draft.prisma](prisma-schema-draft.prisma) · [api-design.md](api-design.md)
@@ -142,8 +142,10 @@ erDiagram
         bigint id PK
         bigint actor_hr_user_id FK
         text export_type "EMPLOYEES | SALARY_HISTORY"
+        text status "STARTED | COMPLETED"
         jsonb filters_applied
-        int row_count
+        int row_count "NULL for STARTED, NOT NULL for COMPLETED"
+        text request_id "pairs STARTED with COMPLETED"
         timestamptz recorded_at
     }
 ```
@@ -216,6 +218,11 @@ CHECK (country_code ~ '^[A-Z]{2}$')
 -- audit_log: an actor is required for everything except unauthenticated events
 CHECK (actor_hr_user_id IS NOT NULL OR action IN ('LOGIN_FAILURE'))
 CHECK (action <> 'LOGIN_FAILURE' OR actor_email_attempted IS NOT NULL)
+
+-- export_log: two append-only records per export (v3, ADR-022)
+CHECK (status IN ('STARTED','COMPLETED'))
+CHECK (export_type IN ('EMPLOYEES','SALARY_HISTORY'))
+CHECK ((status = 'STARTED') = (row_count IS NULL))   -- COMPLETED must carry a count
 ```
 
 `supersedes_event_id < id` is worth pausing on: because ids are monotonic and a correction
@@ -225,9 +232,20 @@ and no trigger needed.
 
 ### 3.5 Decimal scale validation (new)
 
-`NUMERIC(20,4)` coerces every stored value to scale 4, so `scale(amount)` cannot be used to
-detect over-precision after the fact — `100.00` becomes `100.0000`. The check is therefore
-value-based, in the `BEFORE INSERT` trigger (§8):
+`NUMERIC(20,4)` coerces every value **before** any `BEFORE` trigger or `CHECK` sees it, so
+`scale(amount)` is useless *post-coercion* — `100.00` is already `100.0000`, and every stored
+value has scale exactly 4. Two consequences, and both matter:
+
+1. A value-based check in the trigger catches over-precision that survives rounding to
+   scale 4, and nothing beyond it: `85000.00001` coerces to `85000.0000`, which *equals*
+   `round(·, 2)`, so the trigger accepts input it silently altered.
+2. Validating the **original** precision is therefore only possible before coercion, which
+   means before the value reaches a `numeric(20,4)` column. That is why every application
+   append goes through `salary_event_append()`, which receives the amount as `text`, casts it
+   to *unconstrained* `numeric` (where `min_scale()` sees the true scale), and only then
+   inserts (database-implementation-plan.md §2, ADR-020).
+
+The trigger check remains as the backstop for writes made as `acme_owner`:
 
 ```sql
 IF NEW.amount <> round(NEW.amount, c.minor_units) THEN
@@ -353,7 +371,12 @@ The trigger rule, stated precisely:
 > For a **non-correcting** event *E*, let `prior` be the currency of the live event with the
 > greatest `effective_date ≤ E.effective_date` for that employee (excluding *E*). If
 > `prior` exists and `E.currency <> prior`, then *E* must have
-> `effective_date >= CURRENT_DATE` (UTC) and `change_reason = 'CURRENCY_CHANGE'`.
+> `effective_date >= public.utc_today()` and `change_reason = 'CURRENCY_CHANGE'`.
+
+`public.utc_today()` — never `CURRENT_DATE`, which resolves through the session's `TimeZone`
+and would make the same insert succeed or fail depending on the connection (§5.4, ADR-012).
+The comparison is evaluated **after** the function has taken a row lock on the employee, so
+two concurrent appends cannot each read a stale timeline and both pass (§11, ADR-021).
 
 Comparing against the currency **at that point in the timeline** rather than against today's
 currency is what makes the rule behave correctly in the awkward cases: a backdated USD raise
@@ -384,7 +407,7 @@ best knowledge of what this employee was paid on date `D`".
 ```sql
 CREATE FUNCTION salary_as_of(
   p_employee_id bigint,
-  p_as_of       date        DEFAULT (now() AT TIME ZONE 'UTC')::date,
+  p_as_of       date        DEFAULT public.utc_today(),
   p_known_at    timestamptz DEFAULT now()
 ) RETURNS TABLE (salary_event_id bigint, amount numeric(20,4), currency char(3),
                  effective_date date, recorded_at timestamptz, change_reason text)
@@ -417,7 +440,7 @@ SELECT DISTINCT ON (e.employee_id)
        e.employee_id, e.id AS salary_event_id,
        e.amount, e.currency, e.effective_date, e.recorded_at, e.change_reason
 FROM   salary_event e
-WHERE  e.effective_date <= (now() AT TIME ZONE 'UTC')::date
+WHERE  e.effective_date <= public.utc_today()
   AND  NOT EXISTS (SELECT 1 FROM salary_event s WHERE s.supersedes_event_id = e.id)
 ORDER  BY e.employee_id, e.effective_date DESC, e.recorded_at DESC, e.id DESC;
 ```
@@ -437,9 +460,19 @@ on-write `REFRESH` remains the documented scale lever (ADR-006); it is not neede
 ### 5.4 "Today" is UTC, system-wide (finalized)
 
 Every date boundary in the system — the view above, `salary_as_of`'s default, the
-prospective-currency-change rule, dashboard `asOf`, "upcoming" events — uses
-`(now() AT TIME ZONE 'UTC')::date`. There is exactly one definition of today, it is written
-once in SQL, and the UI labels every derived figure with it (`as of 2026-11-22 UTC`).
+prospective-currency-change rule, dashboard `asOf`, "upcoming" events — calls
+
+```sql
+CREATE FUNCTION public.utc_today() RETURNS date
+LANGUAGE sql STABLE PARALLEL SAFE AS $$ SELECT (now() AT TIME ZONE 'UTC')::date $$;
+```
+
+There is exactly one definition of today, written once in SQL, and the UI labels every
+derived figure with it (`as of 2026-11-22 UTC`). `CURRENT_DATE`, `now()::date` and
+`localtimestamp` are forbidden across the codebase and a CI grep enforces it
+(database-implementation-plan.md §3). `utc_today()` is `STABLE`, not `IMMUTABLE`, so it
+cannot appear in a `CHECK` constraint or an index predicate — which is why the
+prospective-currency rule is a trigger and the upcoming-events index is plain.
 
 A per-user timezone would mean two HR Managers in different offices disagree about an
 employee's current salary for up to a day at every change boundary, and an export taken in
@@ -534,16 +567,47 @@ deterministic seed is for.
 Prisma cannot express immutability, so it is enforced in three independent layers. Any one
 of them failing still leaves history intact.
 
-**Layer 1 — privileges.** The application role may only read and append to the three
-append-only tables:
+**Layer 1 — privileges.** The application role reads the append-only tables, appends to two
+of them, and reaches `salary_event` **only** through a guarded function (ADR-020). Function
+privileges are always written with the exact signature, because `acme_owner` may add an
+overload later and an unqualified grant would then cover it too:
 
 ```sql
-REVOKE ALL ON salary_event, audit_log, export_log FROM acme_app;
-GRANT  SELECT, INSERT ON salary_event, audit_log, export_log TO acme_app;
-GRANT  USAGE ON SEQUENCE salary_event_id_seq, audit_log_id_seq, export_log_id_seq TO acme_app;
+REVOKE ALL    ON salary_event, audit_log, export_log FROM acme_app;
+GRANT  SELECT ON salary_event, audit_log, export_log TO   acme_app;
+GRANT  INSERT ON audit_log, export_log               TO   acme_app;   -- NOT salary_event
+GRANT  USAGE  ON SEQUENCE audit_log_id_seq, export_log_id_seq TO acme_app;
+-- No USAGE on salary_event_id_seq: the insert happens inside the definer function,
+-- which runs with acme_owner's privileges.
+
+-- The only append path for salary events.
+REVOKE EXECUTE ON FUNCTION
+  public.salary_event_append(bigint, text, text, date, text, text, bigint, text, bigint)
+  FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION
+  public.salary_event_append(bigint, text, text, date, text, text, bigint, text, bigint)
+  TO acme_app;
+
+-- Read helpers.
+GRANT EXECUTE ON FUNCTION public.utc_today() TO acme_app;
+GRANT EXECUTE ON FUNCTION public.salary_as_of(bigint, date, timestamptz) TO acme_app;
+
+-- Trigger functions are never called directly; PUBLIC's default EXECUTE is removed.
+REVOKE EXECUTE ON FUNCTION public.reject_mutation() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.reject_truncate() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.salary_event_validate() FROM PUBLIC;
+
 -- Mutable tables keep UPDATE; nothing in the schema grants DELETE to the app role.
-GRANT  SELECT, INSERT, UPDATE ON employee, hr_user, hr_session, department TO acme_app;
-GRANT  SELECT ON currency, employee_current_salary, salary_event_resolved TO acme_app;
+GRANT SELECT, INSERT, UPDATE ON employee, hr_user, hr_session, department TO acme_app;
+GRANT USAGE ON SEQUENCE employee_id_seq, hr_user_id_seq, hr_session_id_seq,
+                        department_id_seq TO acme_app;
+GRANT SELECT ON currency, employee_current_salary, salary_event_resolved TO acme_app;
+
+-- Schema and future objects.
+GRANT  USAGE  ON SCHEMA public TO acme_app;      -- USAGE only; never CREATE
+REVOKE CREATE ON SCHEMA public FROM PUBLIC, acme_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE acme_owner IN SCHEMA public
+  REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;       -- new functions are not world-executable
 ```
 
 Prisma Migrate runs as a separate owner role in CI. Even a successful SQL injection through
@@ -566,6 +630,27 @@ CREATE TRIGGER export_log_no_mutate  BEFORE UPDATE OR DELETE ON export_log
   FOR EACH ROW EXECUTE FUNCTION reject_mutation();   -- added in v2
 ```
 
+Row-level triggers do **not** fire on `TRUNCATE`, so a statement-level trigger is required
+on each append-only table or one `TRUNCATE` erases the ledger (v3):
+
+```sql
+CREATE FUNCTION public.reject_truncate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION '% is append-only; TRUNCATE is not permitted', TG_TABLE_NAME
+    USING ERRCODE = 'P0001';
+END $$;
+
+CREATE TRIGGER salary_event_no_truncate BEFORE TRUNCATE ON salary_event
+  FOR EACH STATEMENT EXECUTE FUNCTION public.reject_truncate();
+CREATE TRIGGER audit_log_no_truncate    BEFORE TRUNCATE ON audit_log
+  FOR EACH STATEMENT EXECUTE FUNCTION public.reject_truncate();
+CREATE TRIGGER export_log_no_truncate   BEFORE TRUNCATE ON export_log
+  FOR EACH STATEMENT EXECUTE FUNCTION public.reject_truncate();
+```
+
+`acme_app` holds no `TRUNCATE` privilege either, so this layer exists for `acme_owner` and
+for any DBA session — the roles that could otherwise do it by accident.
+
 **Layer 2b — `BEFORE INSERT` validation on `salary_event`**, for the cross-row rules a
 `CHECK` cannot see. All raise `P0001`:
 
@@ -577,6 +662,11 @@ CREATE TRIGGER export_log_no_mutate  BEFORE UPDATE OR DELETE ON export_log
 | 4 | `amount = round(amount, currency.minor_units)` (§3.5) | `400 INVALID_DECIMAL_SCALE` |
 | 5 | `currency.is_active` | `422 CURRENCY_INACTIVE` |
 | 6 | non-correcting currency change is prospective and reasoned (§4.4) | `422 BACKDATED_CURRENCY_CHANGE` / `422 CURRENCY_CHANGE_REASON_REQUIRED` |
+
+**Layer 2c — `salary_event_append()`.** Validates what only exists before type coercion —
+amount format, true decimal scale via `min_scale()`, magnitude — and takes the per-employee
+row lock that makes the cross-row rules race-free (§11). It is the application's only write
+path, by privilege (ADR-020, ADR-021).
 
 **Layer 3 — services.** The same rules are asserted in the `salaries` service so the user
 gets a precise 4xx instead of a trigger error. Reaching layer 2 means layer 3 has a bug,
@@ -695,10 +785,11 @@ and "scheduled only" (api-design.md §5).
 
 | Scenario | Outcome |
 |---|---|
-| Two HR Managers add a salary event for the same employee simultaneously | Both succeed — appending is always safe. Both are visible in history; D-1 decides deterministically which is current. No lost update is possible because nothing is updated |
+| Two HR Managers add a salary event for the same employee simultaneously | **Serialized** by a `SELECT … FOR UPDATE` row lock on the `employee` row inside `salary_event_append()` (ADR-021). Both ultimately succeed, in a defined order; both are visible in history; D-1 decides deterministically which is current. No lost update is possible because nothing is updated |
 | Two HR Managers correct the **same** event simultaneously | First wins; second fails on `UNIQUE (supersedes_event_id)` → `409 EVENT_ALREADY_SUPERSEDED`. No forked chain can exist |
-| Two concurrent prospective currency changes | Both insert; the later-recorded one wins per D-1. Both are visible, and the UI warning at entry makes the collision apparent |
-| A currency change racing a backdated event | The trigger evaluates `prior` currency from committed rows at insert time under `READ COMMITTED`; a pair that would interleave into an invalid state is not possible, because neither insert alters the other's timeline position |
+| Two concurrent prospective currency changes | The second waits for the first to commit, then re-evaluates `prior` against the **committed** timeline. If the second is now a currency change without `CURRENCY_CHANGE`, it is rejected rather than accepted on a stale read |
+| A currency change racing a later event in the old currency | **This is the write skew the row lock exists for.** Without it, under `READ COMMITTED` each transaction evaluates `prior` against a snapshot that excludes the other, and a timeline such as USD → EUR → USD can be committed with the final event reasoned as `MERIT`. With the lock, the second transaction blocks, re-reads, and is rejected with `CURRENCY_CHANGE_REASON_REQUIRED` (test matrix CONC-02) |
+| An append racing a deactivation of the same employee | The same row lock resolves it: `UPDATE employee` (deactivate) and `SELECT … FOR UPDATE` (append) contend on one row. Whichever commits second sees the other's committed state, so an event can never be appended to an employee who was concurrently deactivated (CONC-03/04) |
 | Two HR Managers edit the same employee record | Optimistic concurrency: `UPDATE employee SET …, version = version + 1 WHERE id = $1 AND version = $2`; zero rows affected → `409 STALE_VERSION` |
 | A read during a salary write | Default `READ COMMITTED` suffices: the event insert and its audit row commit atomically, so a reader never sees a salary change without its audit record |
 
@@ -728,7 +819,9 @@ denormalized currency column, which is what created the inconsistency this chang
 
 ## 12. Open items specific to the data model
 
-Consolidated with the rest in [architecture.md §10](architecture.md). The ones that would
-change this schema rather than the code: average display precision (`minor_units + 2` vs
-`minor_units`), whether `CURRENCY_CHANGE` should be a required `change_reason` or merely
-permitted, `pg_trgm` availability on the chosen host, and audit-log retention.
+Consolidated with the rest in [architecture.md §10](architecture.md). Settled since v2:
+average precision is `minor_units + 2` in the API with display rounding owned by the UI
+(ADR-004); `export_log` now carries `STARTED`/`COMPLETED` records (ADR-022). Still open and
+schema-affecting: whether `CURRENCY_CHANGE` stays a *required* `change_reason`, `pg_trgm`
+availability on the chosen host (also in the Prisma shadow database), and audit/export
+retention.

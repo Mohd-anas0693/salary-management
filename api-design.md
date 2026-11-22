@@ -1,6 +1,6 @@
 # API Design — ACME Employee Salary Management
 
-**Status:** Draft v2 for review · 2026-11-22 · Contract design only, no implementation.
+**Status:** Draft v3 for review · 2026-11-22 · Contract design only, no implementation.
 **Base path:** `/api` · **Format:** JSON (`application/json; charset=utf-8`), UTF-8
 Companion: [architecture.md](architecture.md) · [database-design.md](database-design.md)
 
@@ -39,13 +39,20 @@ so `85000.0000` → `"85000.00"` discards nothing.
 **Averages are the single documented exception.** An average is a division and is not
 exactly representable, so it is rounded to `minor_units + 2` and labelled a derived
 statistic in `meta.rounding`. Sums, medians and individual amounts are exact at
-`minor_units`.
+`minor_units`. **The API always returns the full `minor_units + 2` value; the UI decides how
+to round it for display** — KPI tiles round to `minor_units`, comparison tables may show
+more. The contract carries the precision; presentation owns the rounding (ADR-004).
 
 A JSON number is never used for money in either direction. Request bodies must send
 amounts as strings; a numeric `amount` is rejected with `400 VALIDATION_FAILED` rather than
 silently coerced, because `0.1 + 0.2` arriving from a client is unrecoverable. An amount
 with more decimals than its currency allows is rejected with `400 INVALID_DECIMAL_SCALE`
-and a field-level message naming the permitted scale.
+and a field-level message naming the permitted scale. Zod applies the **strict** rule
+(`"9000000.00"` is rejected for JPY, which takes no decimals) so the client error is
+unambiguous; the database applies the significant-precision rule via `min_scale()`, so it
+rejects only values whose arithmetic would change (ADR-020). Malformed input
+(`"85,000.00"`, `"8.5e4"`, a negative) is `400 INVALID_DECIMAL_FORMAT`; a value past the
+column's range is `400 AMOUNT_OUT_OF_RANGE`.
 
 ### 1.3 Pagination
 
@@ -147,7 +154,7 @@ Single shape for every failure (architecture.md §7):
 
 | Status | Codes |
 |---|---|
-| 400 | `VALIDATION_FAILED`, `INVALID_DECIMAL_SCALE`, `CURRENCY_REQUIRED_FOR_SORT` |
+| 400 | `VALIDATION_FAILED`, `INVALID_DECIMAL_SCALE`, `INVALID_DECIMAL_FORMAT`, `AMOUNT_OUT_OF_RANGE`, `CURRENCY_REQUIRED_FOR_SORT` |
 | 401 | `AUTH_REQUIRED`, `INVALID_CREDENTIALS` |
 | 403 | `FORBIDDEN` |
 | 404 | `NOT_FOUND` |
@@ -598,8 +605,16 @@ with a separate currency column, never a combined `"AED 240,000"` string, so the
 re-imports cleanly. An employee with no current salary exports with those three fields
 empty, as in the third row. The salary-history export includes a `currency` column per row,
 since a history may span currencies. Every cell beginning `=`, `+`, `-`, `@`, tab or CR is
-prefixed with `'` to defeat CSV formula injection (architecture.md §8). Each export inserts
-an `export_log` row with the actor, filters and row count.
+prefixed with `'` to defeat CSV formula injection (architecture.md §8).
+
+**Export auditing (v3).** Each export writes **two** append-only `export_log` rows sharing
+the response's `request_id`: a `STARTED` row before the first byte is streamed (actor,
+export type, filters, `row_count` NULL) and a `COMPLETED` row after the last (same fields
+plus the actual `row_count`). Because `export_log` cannot be updated, a count discovered
+after streaming cannot be written back into the first row — and an export that aborts
+mid-stream must still leave a trace, since a partially delivered bulk export is the
+exfiltration-relevant case. A `STARTED` row with no matching `COMPLETED` row is therefore a
+reviewable signal, not a gap (ADR-022).
 
 ---
 

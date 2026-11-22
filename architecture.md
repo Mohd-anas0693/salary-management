@@ -1,6 +1,6 @@
 # Architecture — ACME Employee Salary Management
 
-**Status:** Draft v2 for review · 2026-11-22 · Architecture only, no implementation.
+**Status:** Draft v3 for review · 2026-11-22 · Architecture only, no implementation.
 **Stack:** React + TypeScript + Vite · Node + Express + TypeScript · PostgreSQL · Prisma ·
 Tailwind + shadcn/ui · Zod · Vitest + Supertest.
 **Companion documents:** [database-design.md](database-design.md) ·
@@ -118,6 +118,7 @@ arrives pre-aggregated from SQL (ADR-006), so the browser never holds 10,000 row
 | Transport | Express 4 + TypeScript, JSON, cookie-based sessions |
 | Validation | Zod schema per endpoint for `params`, `query`, and `body`; unknown keys stripped (no mass assignment). Monetary strings are validated against the currency's `minor_units`, read from the `currency` table |
 | Business rules | Services own invariants: append-only writes, correction linkage, prospective-only currency changes, decimal scale, deactivation rules |
+| Salary appends | Through `salary_event_append()` via `$queryRaw`, not `prisma.salaryEvent.create()` — the app role has no `INSERT` on `salary_event`. The amount is passed as a **string** so its original precision is validated before `numeric(20,4)` coercion (ADR-020) |
 | Transactions | One `prisma.$transaction` per state-changing request; the audit row is written inside it |
 | Analytics | Hand-written SQL via `$queryRaw`, results parsed by Zod before leaving the repository (ADR-006) |
 | Serialization | Explicit DTO mappers. Prisma objects are never returned to `res.json()`; `Decimal` → string at the currency's precision, `BigInt` → string (api-design.md §1.2) |
@@ -213,6 +214,7 @@ introduced, it will be added then, against the real requirement.
 ```
 AppError (code, httpStatus, message, details?, cause?)
 ├── ValidationError      400  VALIDATION_FAILED | INVALID_DECIMAL_SCALE
+│                             | INVALID_DECIMAL_FORMAT | AMOUNT_OUT_OF_RANGE
 │                             | CURRENCY_REQUIRED_FOR_SORT
 ├── UnauthenticatedError 401  AUTH_REQUIRED | INVALID_CREDENTIALS
 ├── ForbiddenError       403  FORBIDDEN
@@ -244,6 +246,7 @@ Uniform error body, same shape for every failure:
 |---|---|
 | `ZodError` | 400 `VALIDATION_FAILED` with per-field `details` |
 | Scale check against `currency.minor_units` | 400 `INVALID_DECIMAL_SCALE` |
+| `P0001` raised by `salary_event_append()` | the code named in the exception's `HINT` — `INVALID_DECIMAL_FORMAT`, `INVALID_DECIMAL_SCALE`, `AMOUNT_OUT_OF_RANGE`, `CURRENCY_INACTIVE` — so one mapping table covers both the service and the database path |
 | Prisma `P2002` (unique) | 409 — `supersedes_event_id` collision becomes `EVENT_ALREADY_SUPERSEDED` |
 | Prisma `P2003` (FK) | 422 `RULE_VIOLATION` (unknown department, currency, employee) |
 | Prisma `P2025` (not found) | 404 `NOT_FOUND` |
@@ -280,12 +283,21 @@ reloading, `422` means the request is coherent but violates a domain rule.
 
 **Least-privilege database role.** The application connects as a role that holds:
 
-- `SELECT, INSERT` — and **no `UPDATE`, no `DELETE`** — on `salary_event`, `audit_log` and
-  `export_log`;
+- `SELECT` on `salary_event`, `audit_log` and `export_log`, and `INSERT` on the latter two
+  only — **no `INSERT` on `salary_event`**, which is appended solely through
+  `EXECUTE` on `salary_event_append(bigint, text, text, date, text, text, bigint, text, bigint)`
+  (ADR-020), and **no `UPDATE` or `DELETE` on any of the three**;
 - `SELECT, INSERT, UPDATE` on `employee`, `hr_user`, `hr_session`, `department`;
 - `SELECT` on `currency` and the two views;
 - **no `DELETE` privilege on any table in the schema**, which is what makes "employees are
-  never physically deleted" (ADR-019) a database guarantee rather than an API convention.
+  never physically deleted" (ADR-019) a database guarantee rather than an API convention;
+- `USAGE` but **not `CREATE`** on schema `public`, so it cannot introduce a definer function
+  of its own; and `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`, so a
+  future function is not world-executable by default.
+
+Every function grant names its exact signature. An unqualified `GRANT EXECUTE ON FUNCTION
+name` would silently extend to any later overload, which in the case of the append function
+would mean extending it to a variant that skips a validation.
 
 Prisma Migrate runs as a separate owner role in CI. Even a successful SQL injection through
 the analytics path cannot rewrite salary history, erase an audit entry, or delete an
@@ -332,21 +344,41 @@ employee.
 | Audit actor | Nullable, scoped by `CHECK` to `LOGIN_FAILURE` only; attempted address recorded | database-design.md §3.6 |
 | `export_log` immutability | Its own trigger, alongside `salary_event` and `audit_log` | database-design.md §8 |
 | Speculative `AccessScope` | Removed (§6) | — |
+| Salary append path | `salary_event_append()` taking the amount as `text`, `SECURITY DEFINER`, `SET search_path = pg_catalog, pg_temp`, fully schema-qualified; `acme_app` holds `EXECUTE` and no `INSERT` | ADR-020 |
+| Original decimal precision | Validated **pre-coercion** with `min_scale()` in the database; strict `scale()` in Zod | ADR-004, ADR-020 |
+| Concurrent appends | Serialized per employee by `SELECT … FOR UPDATE` on the `employee` row inside the append function; also closes the append-vs-deactivate race | ADR-021 |
+| `TRUNCATE` | `BEFORE TRUNCATE … FOR EACH STATEMENT` triggers on all three append-only tables | database-design.md §8 |
+| Export audit | Two append-only rows, `STARTED` then `COMPLETED`, paired by `request_id`; an aborted export leaves its `STARTED` row | ADR-022 |
+| Prisma `views` preview | Dropped; both views read via `$queryRaw` + Zod | ADR-008 |
+| Average precision | API returns `minor_units + 2`; **the UI owns final display rounding** | ADR-004, api-design.md §1.2 |
+| PostgreSQL version | Exact patch pinned in one file, asserted in CI, matched by production | database-implementation-plan.md §1.1 |
 | NFR-6 vs FR-11 | Distinction confirmed: NFR-6 governs application log files; `audit_log` is an access-controlled table | §8 |
 
 ### 10.2 Still open — your decision
 
 | # | Issue | Recommendation |
 |---|---|---|
-| 1 | **Average display precision.** `minor_units + 2` gives analytical resolution but means the dashboard shows `"100093.7500"` where HR may expect `"100093.75"`. | *Keep `minor_units + 2` in the API and let the UI round to `minor_units` for KPI tiles, exposing full precision in comparison tables. Alternative: round to `minor_units` everywhere and accept the loss. Needs one answer either way.* |
-| 2 | **`CURRENCY_CHANGE` as a required reason.** I made it mandatory for a non-correcting currency change, which makes currency switches filterable in history but blocks "promotion + relocation in one event". | *Keep it mandatory; a promotion that also changes currency is two events, which is also the more honest history.* |
-| 3 | **Currency-filter performance.** With currency derived, filtering or sorting by it resolves current salary for the whole population first (database-design.md §11). | *Verify with `EXPLAIN ANALYZE` against the 10,000-employee seed before implementation is called done. If it misses NFR-1, use the ADR-006 materialized view — not a denormalized currency column.* |
-| 4 | **`pg_trgm` availability.** Needs `CREATE EXTENSION` on the chosen host. | *Confirm with the hosting provider. Fallback is a `tsvector` column with GIN, which handles prefix but not mid-word substrings.* |
-| 5 | **Correction that changes currency on a non-latest event.** Permitted today, and it can make an employee's historical currency sequence non-monotonic. | *Permit, with the UI warning already specified. Forbidding it would leave genuinely mis-entered history unfixable.* |
-| 6 | **`Idempotency-Key` on mutations.** | *P1. The append-only model makes a duplicate submission visible and correctable rather than destructive.* |
-| 7 | **Audit and export log retention.** Both tables grow without bound and neither can be deleted by the application role. | *Decide a retention period with whoever owns compliance; implement as a privileged archival job, not an application feature. Out of MVP scope but needs an owner.* |
-| 8 | **Session pruning.** Expired `hr_session` rows accumulate. | *A `DELETE` by the migration/owner role on a schedule — the app role has no `DELETE`. Trivial, but it is an operational task someone must own.* |
+| 1 | **`CURRENCY_CHANGE` as a required reason.** I made it mandatory for a non-correcting currency change, which makes currency switches filterable in history but blocks "promotion + relocation in one event". | *Keep it mandatory; a promotion that also changes currency is two events, which is also the more honest history.* |
+| 2 | **Currency-filter performance.** With currency derived, filtering or sorting by it resolves current salary for the whole population first (database-design.md §11). | *Verify with `EXPLAIN ANALYZE` against the 10,000-employee seed before implementation is called done. If it misses NFR-1, use the ADR-006 materialized view — not a denormalized currency column.* |
+| 3 | **`pg_trgm` availability.** Needs `CREATE EXTENSION` on the chosen host **and in the Prisma shadow database**, since `citext` is a column type (prisma-schema-draft.prisma header). | *Confirm with the hosting provider — it blocks M0. Fallback is a `tsvector` column with GIN, which handles prefix but not mid-word substrings.* |
+| 8 | **PostgreSQL patch version.** The exact `16.x` to pin in CI, and the version production reports. | *Supply both; CI asserts `server_version` against a single pinned value and a mismatch is a release blocker (database-implementation-plan.md §1.1).* |
+| 9 | **`export_log` column shape** for ADR-022: `status` + nullable `row_count` + `request_id`. | *Confirm the shape; the behaviour is already approved, but this changes the Prisma model and the ER diagram.* |
+| 4 | **Correction that changes currency on a non-latest event.** Permitted today, and it can make an employee's historical currency sequence non-monotonic. | *Permit, with the UI warning already specified. Forbidding it would leave genuinely mis-entered history unfixable.* |
+| 5 | **`Idempotency-Key` on mutations.** | *P1. The append-only model makes a duplicate submission visible and correctable rather than destructive.* |
+| 6 | **Audit and export log retention.** Both tables grow without bound and neither can be deleted by the application role. | *Decide a retention period with whoever owns compliance; implement as a privileged archival job, not an application feature. Out of MVP scope but needs an owner.* |
+| 7 | **Session pruning.** Expired `hr_session` rows accumulate. | *A `DELETE` by the migration/owner role on a schedule — the app role has no `DELETE`. Trivial, but it is an operational task someone must own.* |
+
+### 10.3 Phase 3 working rules adopted with ADR-020/021
+
+| Rule | Why it exists |
+|---|---|
+| **One salary append per transaction** | ADR-021's row lock makes multi-employee batches a deadlock risk unless they lock in ascending `employee_id` order |
+| Salary appends use `$queryRaw` on `salary_event_append()` | The app role has no `INSERT` on `salary_event` |
+| Dates cross module boundaries as `'YYYY-MM-DD'` strings | Never `new Date(y, m, d)` or local getters on a `@db.Date` value, which shift the day at negative UTC offsets |
+| `CURRENT_DATE` and friends are banned in SQL | CI greps for them; `public.utc_today()` is the single definition site |
 
 ---
 
-**Awaiting review of all five artifacts before any implementation begins.**
+**Awaiting review before any implementation begins.** Phase 3 scope and sequencing live in
+[database-implementation-plan.md](database-implementation-plan.md); its test specification is
+[sql-test-matrix.md](sql-test-matrix.md).

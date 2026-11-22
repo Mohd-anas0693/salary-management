@@ -1,9 +1,10 @@
 # Architecture Decision Records — ACME Employee Salary Management
 
-**Status:** Draft v2 for review · 2026-11-22
+**Status:** Draft v3 for review · 2026-11-22
 Each record states the decision, what was genuinely considered against it, what it costs,
 and the condition under which it should be revisited. ADR-001 … ADR-010 were accepted in
-v1; **ADR-004, ADR-005 and ADR-006 are revised** and **ADR-011 … ADR-019 are new**.
+v1; ADR-011 … ADR-019 in v2. In **v3**, ADR-004, ADR-008 and ADR-012 are revised and
+**ADR-020 … ADR-022 are new**.
 Companion: [architecture.md](architecture.md) · [database-design.md](database-design.md) ·
 [api-design.md](api-design.md)
 
@@ -67,8 +68,10 @@ reconstruction of salary for any date, and an audit trail that withstands scruti
 
 **Decision.** `salary_event` is append-only. Current salary **and current currency** are
 derived, never stored. A mistake is corrected by inserting a new event linked through
-`supersedes_event_id`. Enforced by trigger and by withheld `UPDATE`/`DELETE` grants
-(database-design.md §8).
+`supersedes_event_id`. Enforced by withheld `UPDATE`/`DELETE` grants, by
+`BEFORE UPDATE OR DELETE … FOR EACH ROW` triggers, and — because row triggers do not fire on
+`TRUNCATE` — by `BEFORE TRUNCATE … FOR EACH STATEMENT` triggers on all three append-only
+tables (database-design.md §8).
 
 **Alternatives considered.**
 
@@ -109,6 +112,14 @@ payroll system output.
    more decimals than their currency permits.
 4. **Averages are not cast to a money scale.** They are computed as exact `sum / count` and
    rounded explicitly to `minor_units + 2`, labelled a derived statistic in response `meta`.
+   The **API always returns that full precision; the UI owns final display rounding** (KPI
+   tiles round to `minor_units`). The contract carries precision, presentation decides what
+   to show — so a future dashboard change never needs an API change.
+5. **The permitted scale is validated before type coercion** (v3). `numeric(20,4)` rounds
+   input before any `BEFORE` trigger or `CHECK` can see it, so the trigger alone cannot tell
+   `85000.00` from `85000.00001`. Validation therefore happens in `salary_event_append()`,
+   which receives the amount as `text` — see ADR-020. The trigger's value-based check stays
+   as the backstop for `acme_owner` writes.
 
 **Alternatives considered.**
 
@@ -247,11 +258,24 @@ history is mutable — unacceptable for an audit system); a pure SQL migration t
 Prisma as a read-only client (loses the typed client's main benefit for ordinary CRUD);
 `prisma db push` (no reviewable migration artifact, unusable for production).
 
+**Views: the fallback is now the decision (v3).** The `views` preview feature is dropped.
+`employee_current_salary` and `salary_event_resolved` are created by SQL and read through
+`$queryRaw` with Zod-parsed row schemas. Rationale: we already write raw SQL for analytics
+and (per ADR-020) for salary appends, so typed view models bought little; and `$queryRaw`
+returns `numeric` as a string, which matches the money-as-string DTO contract more directly
+than a Prisma `Decimal` round-trip. One fewer preview feature in a payroll system is worth
+more than typed view access.
+
+`postgresqlExtensions` is **retained**, deliberately: `citext` is a column type, so
+`prisma migrate dev` must create it in the *shadow* database too, and declaring the
+extensions in the datasource is what makes that happen. Creating them only in M0 would leave
+the shadow database without `citext`/`pg_trgm` and break `migrate dev`.
+
 **Consequences.** Full type safety where it helps, real database guarantees where they
-matter. Cost: migrations are partly hand-written and must be reviewed as code, and
-`prisma migrate dev` regeneration must not silently drop the appended SQL — the test suite
-catches that. The schema draft also pins the two Prisma preview features it relies on
-(`views`, `postgresqlExtensions`) and documents a fallback for each.
+matter. Cost: migrations are partly hand-written and must be reviewed as code; `prisma
+migrate dev` regeneration must not silently drop the appended SQL — CI's
+`migrate diff --exit-code` check catches that; and two read paths (`$queryRaw` + Zod) are
+hand-maintained.
 
 ---
 
@@ -361,6 +385,16 @@ offices disagree about an employee's current salary for up to a day at every cha
 boundary, and an export taken in Dubai would not reconcile with one taken in New York. An
 organization-level configured timezone was also considered; it is a single setting today but
 becomes a migration if ACME ever changes it, and it buys nothing a label does not.
+
+**Implementation (v3).** The expression is wrapped once as
+`public.utc_today() RETURNS date LANGUAGE sql STABLE`, and every view, function, trigger and
+repository query calls it. `CURRENT_DATE`, `current_date`, `now()::date`, `localtimestamp`
+and any `AT TIME ZONE` with a non-UTC zone are forbidden, and a CI grep over migration and
+query SQL fails the build on them — one allow-listed definition site. `ALTER DATABASE … SET
+timezone='UTC'` is set as defense in depth but never relied upon, and the whole test suite
+runs under three session timezones to prove it. `utc_today()` is `STABLE`, not `IMMUTABLE`,
+so it cannot appear in a `CHECK` or an index predicate — which is exactly why the
+prospective-currency rule is a trigger and the upcoming-events index is plain.
 
 **Consequences.** One definition of "today" in the whole system. Cost: an HR Manager in
 UTC+4 entering an event late in their day may see it classed as effective "tomorrow"; the
@@ -496,3 +530,126 @@ convenience in an audited HR system is not worth one permanently dangerous code 
 which also makes the privilege model simpler to state and to test (database-design.md §8).
 Cost: a handful of deactivated rows that are genuinely junk will persist. That is the
 cheaper mistake.
+
+---
+
+## ADR-020 — Salary events are appended only through a guarded `SECURITY DEFINER` function *(new in v3)*
+
+**Context.** `numeric(20,4)` applies its typmod when the value is coerced, which happens
+*before* `BEFORE` triggers fire and before `CHECK` constraints evaluate. `NEW.amount` is
+therefore already rounded, and the documented rule `amount = round(amount, minor_units)`
+cannot see the original input: `85000.00001` USD, `9000000.00004` JPY and `12345.678004` KWD
+all coerce to values that satisfy it. The system would silently store a different number
+than it was sent — in an audited payroll ledger, the wrong failure mode. `scale()` is no help
+post-coercion, because every stored value has scale exactly 4.
+
+**Decision.** Create `public.salary_event_append(bigint, text, text, date, text, text,
+bigint, text, bigint)` as the **only** path by which the application appends a salary event.
+
+1. The amount arrives as `text` and is cast to **unconstrained** `numeric`, which preserves
+   the input's true scale, so `min_scale()` sees it. Format, scale and magnitude are checked
+   there; the `INSERT` that follows coerces losslessly.
+2. `SECURITY DEFINER`, owned by `acme_owner` (which is **not** a superuser), with
+   `SET search_path = pg_catalog, pg_temp` — `pg_temp` listed *last*, because it is searched
+   first when unlisted and would otherwise let a caller shadow a table with a temp one. Every
+   object is schema-qualified (`public.salary_event`, `public.currency`, `public.employee`,
+   `public.utc_today()`).
+3. `REVOKE EXECUTE … FROM PUBLIC` with the exact signature (definer functions are
+   world-executable by default), then `GRANT EXECUTE` to `acme_app`.
+4. `REVOKE INSERT ON salary_event FROM acme_app`, and no `USAGE` on `salary_event_id_seq` —
+   the sequence is advanced inside the definer context. `acme_app` also holds `USAGE` but not
+   `CREATE` on schema `public`, so it cannot introduce a definer function of its own.
+5. `recorded_at` and `id` remain server-assigned; the function exposes no parameter for
+   either, so a caller cannot backdate *when a change was recorded* (only when it takes
+   effect).
+
+**Alternatives considered.**
+
+| Option | Why rejected |
+|---|---|
+| Keep `numeric(20,4)` and rely on the trigger's `round()` comparison | Does not detect input beyond scale 4 — the actual defect |
+| Bare `numeric` column, or `CREATE DOMAIN money_amount AS numeric CHECK (scale(VALUE) <= 4)` | Strongest guarantee, and it protects `acme_owner` too. Rejected as primary because it changes the confirmed `NUMERIC(20,4)` decision and Prisma can express neither a bare `numeric` nor a domain — `Decimal` without `@db.Decimal` emits `decimal(65,30)`, so every later `migrate diff` reports drift and offers to "fix" the column |
+| Validate only in Zod | Already done, and it is layer 3. It cannot protect the seed, a future import, or a hurried `$executeRaw` — the paths that touch the most rows |
+| Store the client's raw string alongside the numeric | Two shapes of the same money, free to disagree — the flaw ADR-011 removed |
+| `trim_scale()` on write | Normalizes silently; the client is never told its input was altered |
+
+**Consequences.** Every application write validates identically because there is exactly one
+write path, enforced by privilege rather than convention. Costs, stated plainly: salary
+inserts use `$queryRaw` instead of `prisma.salaryEvent.create()`, so the typed client is lost
+for one table's inserts (reads are unaffected); error mapping reads the exception's `HINT` to
+choose the HTTP code; and `acme_owner` — migrations, the seed, a DBA — still bypasses the
+text check, which is why the seed validates amount **strings** before insertion (ADR-020 does
+not cover owner writes, and the plan says so rather than implying otherwise).
+
+---
+
+## ADR-021 — Concurrent appends are serialized per employee by a row lock *(new in v3)*
+
+**Context.** The currency-timeline rules (ADR-011) are cross-row: the trigger reads the
+employee's committed events to find the currency in force at the new event's effective date.
+Under `READ COMMITTED`, two concurrent transactions each evaluate that rule against a
+snapshot that excludes the other — a write skew. Concretely, with a committed history of
+USD: T1 appends a prospective EUR `CURRENCY_CHANGE` effective T+10 while T2 appends a USD
+`MERIT` event effective T+20. Each is valid against its own snapshot; together they commit a
+timeline that switches USD → EUR → USD where the final switch carries no
+`CURRENCY_CHANGE` reason. The same skew lets an append race a deactivation and land an event
+on an employee who is `INACTIVE` by the time both commit.
+
+**Decision.** `salary_event_append()` begins with
+
+```sql
+SELECT status, hire_date INTO v_status, v_hire_date
+FROM   public.employee
+WHERE  id = p_employee_id
+FOR    UPDATE;
+```
+
+Appends for one employee therefore serialize on that employee's row, and the trigger's
+timeline read happens while the lock is held, against committed data. Because deactivation
+is an `UPDATE employee`, it contends on the same row — so the append-versus-deactivate race
+is closed by the same lock, with no second mechanism.
+
+**Alternatives considered.**
+
+| Option | Why rejected |
+|---|---|
+| `SERIALIZABLE` for the append transaction | Correct, but it pushes retry logic into every caller and makes an unrelated concurrent read able to abort a salary write. A payroll append is rare; paying a global isolation cost for it is poor value |
+| `pg_advisory_xact_lock(namespace, employee_id)` | Equivalent serialization, but it does nothing about the deactivation race and adds a key-space convention to remember. Kept as the documented alternative if an append ever must not touch `employee` |
+| Unique constraint on `(employee_id, effective_date)` | Would not address currency skew at all, and ADR-013 deliberately permits duplicate effective dates |
+| Accept the skew and detect it later | A reconciliation job over an append-only ledger cannot repair a bad timeline, only report it |
+
+**Consequences.** Appends for different employees never contend, so throughput is unaffected
+at this write volume. Appends for one employee queue behind each other and the second
+re-evaluates against committed state — meaning it may now be *rejected* where it would
+previously have been wrongly accepted, which is the point. Two rules follow and are
+documented: **one append per transaction**, and any future batch append must lock employees
+in ascending `id` order to avoid deadlocks. The seed, which runs single-threaded as
+`acme_owner` with set-based inserts, takes no lock and needs none.
+
+---
+
+## ADR-022 — Exports are audited with paired `STARTED` and `COMPLETED` records *(new in v3)*
+
+**Context.** `export_log.row_count` is only known after the stream finishes, but `export_log`
+is append-only — so the row cannot be written first and updated later. Writing a single row
+after success means an export that **aborts mid-stream leaves no record at all**, which is
+precisely the case that matters: architecture.md §8 names bulk export as the realistic
+exfiltration path, and a partially delivered export is a partially successful one.
+
+**Decision.** Each export writes two append-only rows sharing the request's `request_id`:
+`STARTED` before the first byte (actor, export type, filters, `row_count` NULL) and
+`COMPLETED` after the last (same fields plus the real count). `CHECK ((status = 'STARTED') =
+(row_count IS NULL))` keeps the pair honest. A `STARTED` row with no `COMPLETED` sibling is a
+reviewable signal — an abort, a crash, or a client that disconnected after receiving part of
+the file.
+
+**Alternatives considered.** Counting first with a separate `COUNT(*)`, then inserting one
+row, then streaming: one extra full-population query per export, a count that can disagree
+with what was streamed, and still no record of an abort. Making `export_log` updatable:
+breaks the append-only guarantee for a convenience. Logging exports only to the application
+log: not queryable by HR, and NFR-6 forbids amounts there — the point of a table.
+
+**Consequences.** Export auditing now distinguishes attempted from completed, and the
+`request_id` ties both rows to the server log. Costs: two inserts per export instead of one,
+a nullable `row_count`, and one more `export_type`-adjacent column — a small schema change
+to a table that holds no money.

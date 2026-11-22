@@ -1,5 +1,5 @@
 // =============================================================================
-// ACME Employee Salary Management — Prisma schema DRAFT v2
+// ACME Employee Salary Management — Prisma schema DRAFT v3
 // Status: design draft for review (2026-11-22). NO migrations generated yet.
 // Companion: database-design.md (authoritative for constraints this file cannot express)
 // =============================================================================
@@ -11,7 +11,10 @@
 //
 // WHAT PRISMA CANNOT EXPRESS — hand-written SQL appended to the generated migration
 // (database-design.md §8), verified by integration tests:
-//   1. Append-only triggers on salary_event, audit_log AND export_log (no UPDATE/DELETE)
+//   1. Append-only protection on salary_event, audit_log AND export_log:
+//        - BEFORE UPDATE OR DELETE ... FOR EACH ROW       -> reject_mutation()
+//        - BEFORE TRUNCATE        ... FOR EACH STATEMENT  -> reject_truncate()
+//          (row triggers do NOT fire on TRUNCATE; without this, one statement erases the ledger)
 //   2. BEFORE INSERT trigger on salary_event:
 //        a. employee ACTIVE                       -> 422 EMPLOYEE_INACTIVE
 //        b. effective_date >= employee.hire_date
@@ -28,8 +31,20 @@
 //   6. GIN trigram index on employee.search_text + the pg_trgm extension
 //   7. Generated column employee.search_text
 //   8. Partial index hr_session(token_hash) WHERE revoked_at IS NULL
-//   9. GRANTs: app role has SELECT/INSERT only on the three append-only tables and holds
-//      no DELETE privilege on any table
+//   9. salary_event_append(bigint, text, text, date, text, text, bigint, text, bigint):
+//      SECURITY DEFINER, owned by acme_owner, SET search_path = pg_catalog, pg_temp.
+//      Receives the amount as TEXT so the ORIGINAL decimal scale can be validated with
+//      min_scale() BEFORE numeric(20,4) coercion rounds it away, and takes a per-employee
+//      SELECT ... FOR UPDATE lock so concurrent appends cannot bypass the currency
+//      timeline rules (ADR-020, ADR-021).
+//  10. GRANT/REVOKE with exact signatures. acme_app has SELECT on all three append-only
+//      tables, INSERT on audit_log and export_log only, EXECUTE on salary_event_append,
+//      utc_today and salary_as_of — and NO INSERT on salary_event, no DELETE anywhere,
+//      no CREATE on schema public.
+//  11. utc_today() — the single definition of "today" (UTC); CURRENT_DATE is forbidden.
+//  12. The two read views (employee_current_salary, salary_event_resolved). They are NOT
+//      Prisma `view` models: the `views` preview feature was dropped, and both are read
+//      through $queryRaw with Zod-parsed results (ADR-008).
 //
 // SERIALIZATION RULES (enforced in DTO mappers, not here):
 //   - Decimal  -> JSON string, rounded to currency.minor_units  ("85000.00", "9000000",
@@ -57,22 +72,24 @@
 //   OK  Self-relation 1:1 via @unique on the FK scalar, with a named relation on both
 //       sides; the back-relation field is optional and declares no fields/references.
 //   OK  Optional relation + onDelete: Restrict    -> explicit, overrides the SetNull default
-//   PREVIEW  previewFeatures = ["views"]          -> `view` blocks are still preview in 6.x;
-//            views are NOT created by `prisma migrate` (our SQL creates them) and each view
-//            needs a unique identifier for the client, provided here via @unique.
+//   DROPPED  previewFeatures = ["views"]          -> removed in v3 by decision. The two SQL
+//            views are read via $queryRaw + Zod, so no preview feature is needed for them.
 //   PREVIEW  previewFeatures = ["postgresqlExtensions"] + datasource `extensions`
-//            -> lets citext/pg_trgm be declared here instead of a manual CREATE EXTENSION.
+//            -> RETAINED deliberately: `citext` is a COLUMN TYPE, so `prisma migrate dev`
+//            must create it in the SHADOW database too. Declaring the extensions here is
+//            what makes that happen; creating them only in M0 would leave the shadow
+//            database without citext/pg_trgm and break `migrate dev`. Still preview in 6.x.
 //   N/A      No Prisma enums (deliberate, see above) -> no ALTER TYPE migrations.
-//   FALLBACK If either preview feature is undesirable in production, the views are read
-//            through $queryRaw with Zod-parsed results and the extensions are created in
-//            the hand-written migration SQL. Both are one-file changes in shared/db.
+//   FALLBACK If `postgresqlExtensions` must also be dropped, the extensions move to M0 SQL
+//            and `migrate dev` is replaced by `migrate diff`-generated migrations applied
+//            with `migrate deploy` — a CI change, not a schema change.
 //   NOTE     generator `prisma-client-js` is the stable default; the newer ESM
 //            `prisma-client` generator is deliberately not used in MVP.
 // =============================================================================
 
 generator client {
   provider        = "prisma-client-js"
-  previewFeatures = ["views", "postgresqlExtensions"]
+  previewFeatures = ["postgresqlExtensions"]
 }
 
 datasource db {
@@ -289,54 +306,48 @@ model AuditLog {
 // Bulk export is the realistic exfiltration path in a compensation system, so
 // every export is recorded with its filters and row count (architecture.md §8).
 // v2: covered by its own immutability trigger, like the other append-only tables.
+// v3: TWO append-only rows per export — STARTED before the stream, COMPLETED after it.
+// The table cannot be updated, so a row_count discovered after streaming cannot be written
+// back into the STARTED row; and an export that aborts mid-stream must still leave a trace,
+// since that is the exfiltration-relevant case (ADR-022).
 
 model ExportLog {
   id             BigInt   @id @default(autoincrement())
   actorHrUserId  BigInt   @map("actor_hr_user_id")
   /// CHECK: EMPLOYEES | SALARY_HISTORY
   exportType     String   @map("export_type")
+  /// CHECK: STARTED | COMPLETED
+  status         String
   filtersApplied Json     @map("filters_applied")
-  rowCount       Int      @map("row_count")
+  /// NULL on STARTED, NOT NULL on COMPLETED:
+  /// CHECK ((status = 'STARTED') = (row_count IS NULL))
+  rowCount       Int?     @map("row_count")
+  /// Pairs the STARTED and COMPLETED rows of one export; also in the server log.
+  requestId      String   @map("request_id")
   recordedAt     DateTime @default(now()) @map("recorded_at") @db.Timestamptz(3)
 
   actor HrUser @relation(fields: [actorHrUserId], references: [id], onDelete: Restrict)
 
   @@index([actorHrUserId, recordedAt(sort: Desc)])
+  @@index([requestId])
   @@map("export_log")
 }
 
 // ================================== Views ====================================
-// Created by hand-written SQL (database-design.md §5). Mapped here as read-only
-// Prisma views so the client is typed; `prisma migrate` does not create them.
-// Both carry currency, which is how the application reads an employee's CURRENT
-// currency now that Employee has no currency column (ADR-011).
-
-view EmployeeCurrentSalary {
-  employeeId    BigInt   @unique @map("employee_id")
-  salaryEventId BigInt   @map("salary_event_id")
-  amount        Decimal  @db.Decimal(20, 4)
-  currency      String   @db.Char(3)
-  effectiveDate DateTime @map("effective_date") @db.Date
-  recordedAt    DateTime @map("recorded_at") @db.Timestamptz(3)
-  changeReason  String   @map("change_reason")
-
-  @@map("employee_current_salary")
-}
-
-view SalaryEventResolved {
-  id                BigInt    @unique
-  employeeId        BigInt    @map("employee_id")
-  amount            Decimal   @db.Decimal(20, 4)
-  currency          String    @db.Char(3)
-  effectiveDate     DateTime  @map("effective_date") @db.Date
-  recordedAt        DateTime  @map("recorded_at") @db.Timestamptz(3)
-  changeReason      String    @map("change_reason")
-  note              String?
-  supersedesEventId BigInt?   @map("supersedes_event_id")
-  correctionReason  String?   @map("correction_reason")
-  supersededById    BigInt?   @map("superseded_by_id")
-  supersededAt      DateTime? @map("superseded_at") @db.Timestamptz(3)
-  isSuperseded      Boolean   @map("is_superseded")
-
-  @@map("salary_event_resolved")
-}
+// DROPPED as Prisma `view` models in v3 (the `views` preview feature is gone). Both views
+// are created by hand-written SQL (database-design.md §5) and read through
+// `$queryRaw` with Zod-parsed row schemas in shared/db:
+//
+//   employee_current_salary(employee_id, salary_event_id, amount, currency,
+//                           effective_date, recorded_at, change_reason)
+//     - one row per employee WITH a current salary; absent for employees with none
+//     - carries the CURRENT CURRENCY, which is how the app reads it now that Employee
+//       has no currency column (ADR-011)
+//
+//   salary_event_resolved(... salary_event columns ..., superseded_by_id, superseded_at,
+//                         is_superseded)
+//     - adds derived supersession via the 1:1 LEFT JOIN on supersedes_event_id (ADR-009)
+//
+// Decimal columns arrive as strings from $queryRaw and are parsed with a Zod decimal-string
+// schema, which suits the DTO contract (money is a string on the wire) better than the
+// Prisma Decimal round-trip did.
